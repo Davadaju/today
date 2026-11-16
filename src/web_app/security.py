@@ -1,13 +1,14 @@
+import csv
+import io
 import logging
 import os
 import re
-import time
 from datetime import datetime, timedelta, timezone
+
 import psycopg
 import pyotp
-import csv
-import io
-import hmac
+from psycopg import sql
+from pyotp.exceptions import OTPVerificationError  # requiere pyotp >= 2.11.0
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from cryptography.fernet import Fernet
@@ -27,6 +28,12 @@ cipher = Fernet(FERNET_KEY.encode())
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_MINUTES = 5
 TOTP_INTERVAL = 30
+
+# Hash señuelo: se verifica cuando el usuario no existe para que el tiempo de
+# respuesta sea igual y no se pueda saber qué usuarios están registrados.
+_DUMMY_HASH = ph.hash("usuario-inexistente-señuelo")
+
+_TABLAS_PERMITIDAS = {"usuarios", "administradores"}
 
 
 def get_db_connection():
@@ -69,6 +76,49 @@ def encrypt_data(plain_text: str) -> bytes:
 
 def decrypt_data(cipher_bytes: bytes) -> str:
     return cipher.decrypt(bytes(cipher_bytes)).decode("utf-8")
+
+
+def _register_failure(cur, conn, tabla: str, row_id: int, now: datetime) -> None:
+    """
+    Suma un intento fallido de forma atómica en PostgreSQL (sin leer-modificar-escribir
+    en Python) y bloquea la cuenta al llegar al máximo. Si un bloqueo anterior ya
+    venció, el contador vuelve a empezar en 1.
+    """
+    if tabla not in _TABLAS_PERMITIDAS:
+        raise ValueError("Tabla no permitida")
+
+    cur.execute(
+        sql.SQL(
+            """
+            UPDATE {tabla}
+            SET intentos_fallidos = CASE
+                    WHEN bloqueado_hasta IS NOT NULL AND bloqueado_hasta <= %s THEN 1
+                    ELSE intentos_fallidos + 1
+                END
+            WHERE id = %s
+            RETURNING intentos_fallidos
+            """
+        ).format(tabla=sql.Identifier(tabla)),
+        (now, row_id),
+    )
+    attempts = cur.fetchone()[0]
+    new_lock = now + timedelta(minutes=LOCKOUT_MINUTES) if attempts >= MAX_FAILED_ATTEMPTS else None
+    cur.execute(
+        sql.SQL("UPDATE {tabla} SET bloqueado_hasta = %s WHERE id = %s").format(
+            tabla=sql.Identifier(tabla)
+        ),
+        (new_lock, row_id),
+    )
+    conn.commit()
+
+
+def _verify_totp_step(totp_secret_enc: bytes, otp_code: str) -> int | None:
+    """Devuelve el paso (timecode) que coincidió o None si el código no es válido."""
+    totp = pyotp.TOTP(decrypt_data(totp_secret_enc), interval=TOTP_INTERVAL)
+    try:
+        return totp.verify_and_get_timecode(otp_code, valid_window=1)
+    except OTPVerificationError:
+        return None
 
 
 def register_user(
@@ -141,13 +191,10 @@ def register_user(
 
 def authenticate_user(identifier: str, password: str, otp_code: str) -> tuple[bool, str, dict | None]:
     """
-    Evalúa las 3 variables (Usuario/Correo, Contraseña, OTP) considerando:
-    1. Usuario no existe
-    2. Cuenta bloqueada por Rate Limiting
-    3. Contraseña incorrecta
-    4. Código OTP inválido
-    5. Retry Attack (código OTP ya usado en la misma ventana de 30s)
-    6. Acceso exitoso
+    Evalúa las 3 variables (Usuario/Correo, Contraseña, OTP) aplicando:
+    - Rate Limiting (bloqueo tras intentos fallidos)
+    - Verificación nativa verify_and_get_timecode() de PyOTP
+    - Actualización atómica en PostgreSQL para evitar Replay Attacks y Race Conditions
     """
     clean_id = identifier.strip().lower()
     clean_otp = otp_code.strip()
@@ -163,7 +210,7 @@ def authenticate_user(identifier: str, password: str, otp_code: str) -> tuple[bo
                 cur.execute(
                     """
                     SELECT id, usuario, correo, contrasena_hash, secreto_totp_cifrado,
-                           ultimo_paso_otp, intentos_fallidos, bloqueado_hasta,
+                           bloqueado_hasta,
                            nombre_completo_cifrado, tipo_sangre_cifrado, ultimos_4_tarjeta
                     FROM usuarios
                     WHERE usuario = %s OR correo = %s
@@ -172,72 +219,53 @@ def authenticate_user(identifier: str, password: str, otp_code: str) -> tuple[bo
                 )
                 row = cur.fetchone()
 
-                # Caso 1: Usuario no existe
                 if not row:
+                    try:
+                        ph.verify(_DUMMY_HASH, password)
+                    except VerifyMismatchError:
+                        pass
                     return False, generic_error, None
 
                 (
                     user_id, username, email, password_hash, totp_secret_enc,
-                    last_otp_step, failed_attempts, locked_until,
+                    locked_until,
                     full_name_enc, blood_type_enc, card_last4
                 ) = row
 
                 now = datetime.now(timezone.utc)
 
-                # Caso 2: Rate Limiting (bloqueo temporal)
                 if locked_until and locked_until > now:
                     remaining = int((locked_until - now).total_seconds() // 60) + 1
                     return False, f"Cuenta bloqueada temporalmente por seguridad. Intente en {remaining} min.", None
 
-                def register_failure():
-                    new_attempts = failed_attempts + 1
-                    new_lock = now + timedelta(minutes=LOCKOUT_MINUTES) if new_attempts >= MAX_FAILED_ATTEMPTS else None
-                    cur.execute(
-                        "UPDATE usuarios SET intentos_fallidos = %s, bloqueado_hasta = %s WHERE id = %s",
-                        (new_attempts, new_lock, user_id),
-                    )
-                    conn.commit()
-
-                # Caso 3: Verificar contraseña con Argon2
                 try:
                     ph.verify(password_hash, password)
                 except VerifyMismatchError:
-                    register_failure()
+                    _register_failure(cur, conn, "usuarios", user_id, now)
                     return False, generic_error, None
 
-                # Caso 4 y 5: Verificar OTP y prevenir Retry Attacks
                 if not re.fullmatch(r"\d{6}", clean_otp):
-                    register_failure()
+                    _register_failure(cur, conn, "usuarios", user_id, now)
                     return False, generic_error, None
 
-                totp_secret = decrypt_data(totp_secret_enc)
-                totp = pyotp.TOTP(totp_secret, interval=TOTP_INTERVAL)
-                current_step = int(time.time()) // TOTP_INTERVAL
-
-                matched_step = None
-                for offset in (-1, 0, 1):
-                    candidate_time = (current_step + offset) * TOTP_INTERVAL
-                    if totp.verify(clean_otp, for_time=candidate_time, valid_window=0):
-                        matched_step = current_step + offset
-                        break
-
+                matched_step = _verify_totp_step(totp_secret_enc, clean_otp)
                 if matched_step is None:
-                    register_failure()
+                    _register_failure(cur, conn, "usuarios", user_id, now)
                     return False, generic_error, None
 
-                if matched_step <= (last_otp_step or 0):
-                    register_failure()
-                    return False, "Este código OTP ya fue utilizado. Espere el siguiente código de 30 segundos.", None
-
-                # Caso 6: Acceso exitoso
+                # Actualización atómica recomendada por PyOTP contra Replay Attacks
                 cur.execute(
                     """
                     UPDATE usuarios
                     SET intentos_fallidos = 0, bloqueado_hasta = NULL, ultimo_paso_otp = %s
-                    WHERE id = %s
+                    WHERE id = %s AND (ultimo_paso_otp IS NULL OR ultimo_paso_otp < %s)
                     """,
-                    (matched_step, user_id),
+                    (matched_step, user_id, matched_step),
                 )
+                if cur.rowcount != 1:
+                    _register_failure(cur, conn, "usuarios", user_id, now)
+                    return False, "Este código OTP ya fue utilizado. Espere el siguiente código de 30 segundos.", None
+
                 conn.commit()
 
                 user_profile = {
@@ -252,156 +280,6 @@ def authenticate_user(identifier: str, password: str, otp_code: str) -> tuple[bo
     except Exception:
         logger.exception("Error interno durante la autenticación de usuario")
         return False, "Servicio de autenticación temporalmente no disponible. Intente más tarde.", None
-
-## Parte de admin, descarga de datos.
-
-def authenticate_admin(identifier: str, password: str, otp_code: str) -> tuple[bool, str, str | None]:
-    """
-    Autentica a un administrador contra la tabla aislada `administradores`
-    exigiendo sus 3 variables (Usuario/Correo, Contraseña Argon2id y OTP Fernet).
-    """
-    clean_id = identifier.strip().lower()
-    clean_otp = otp_code.strip()
-
-    if not clean_id or not password or not clean_otp:
-        return False, "Todos los campos son obligatorios.", None
-
-    generic_error = "Credenciales administrativas o código OTP inválidos."
-
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, usuario, contrasena_hash, secreto_totp_cifrado,
-                           ultimo_paso_otp, intentos_fallidos, bloqueado_hasta, activo
-                    FROM administradores
-                    WHERE usuario = %s OR correo = %s
-                    """,
-                    (clean_id, clean_id),
-                )
-                row = cur.fetchone()
-
-                if not row:
-                    return False, generic_error, None
-
-                (
-                    admin_id, username, password_hash, totp_secret_enc,
-                    last_otp_step, failed_attempts, locked_until, activo
-                ) = row
-
-                if not activo:
-                    return False, "Cuenta administrativa deshabilitada.", None
-
-                now = datetime.now(timezone.utc)
-
-                if locked_until and locked_until > now:
-                    remaining = int((locked_until - now).total_seconds() // 60) + 1
-                    return False, f"Cuenta bloqueada por seguridad. Intente en {remaining} min.", None
-
-                def register_admin_failure():
-                    new_attempts = failed_attempts + 1
-                    new_lock = now + timedelta(minutes=LOCKOUT_MINUTES) if new_attempts >= MAX_FAILED_ATTEMPTS else None
-                    cur.execute(
-                        "UPDATE administradores SET intentos_fallidos = %s, bloqueado_hasta = %s WHERE id = %s",
-                        (new_attempts, new_lock, admin_id),
-                    )
-                    conn.commit()
-
-                try:
-                    ph.verify(password_hash, password)
-                except VerifyMismatchError:
-                    register_admin_failure()
-                    return False, generic_error, None
-
-                if not re.fullmatch(r"\d{6}", clean_otp):
-                    register_admin_failure()
-                    return False, generic_error, None
-
-                totp_secret = decrypt_data(totp_secret_enc)
-                totp = pyotp.TOTP(totp_secret, interval=TOTP_INTERVAL)
-                current_step = int(time.time()) // TOTP_INTERVAL
-
-                matched_step = None
-                for offset in (-1, 0, 1):
-                    candidate_time = (current_step + offset) * TOTP_INTERVAL
-                    if totp.verify(clean_otp, for_time=candidate_time, valid_window=0):
-                        matched_step = current_step + offset
-                        break
-
-                if matched_step is None:
-                    register_admin_failure()
-                    return False, generic_error, None
-
-                if matched_step <= (last_otp_step or 0):
-                    register_admin_failure()
-                    return False, "Este código OTP ya fue utilizado. Espere el siguiente código de 30 segundos.", None
-
-                cur.execute(
-                    """
-                    UPDATE administradores
-                    SET intentos_fallidos = 0, bloqueado_hasta = NULL, ultimo_paso_otp = %s
-                    WHERE id = %s
-                    """,
-                    (matched_step, admin_id),
-                )
-                conn.commit()
-                return True, "Acceso administrativo concedido.", username
-
-    except Exception:
-        logger.exception("Error interno en authenticate_admin")
-        return False, "Error de autenticación administrativa.", None
-
-
-def verify_admin_stepup_otp(admin_username: str, otp_code: str) -> tuple[bool, str]:
-    """Re-autenticación con nuevo código OTP de la tabla `administradores` para exportar CSV descifrado."""
-    clean_otp = otp_code.strip()
-    if not admin_username or not re.fullmatch(r"\d{6}", clean_otp):
-        return False, "Ingrese un código OTP válido de 6 dígitos."
-
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, secreto_totp_cifrado, ultimo_paso_otp
-                    FROM administradores
-                    WHERE usuario = %s AND activo = TRUE
-                    """,
-                    (admin_username,),
-                )
-                row = cur.fetchone()
-                if not row:
-                    return False, "Administrador no válido."
-
-                admin_id, totp_secret_enc, last_otp_step = row
-                totp_secret = decrypt_data(totp_secret_enc)
-                totp = pyotp.TOTP(totp_secret, interval=TOTP_INTERVAL)
-                current_step = int(time.time()) // TOTP_INTERVAL
-
-                matched_step = None
-                for offset in (-1, 0, 1):
-                    candidate_time = (current_step + offset) * TOTP_INTERVAL
-                    if totp.verify(clean_otp, for_time=candidate_time, valid_window=0):
-                        matched_step = current_step + offset
-                        break
-
-                if matched_step is None:
-                    return False, "Código OTP inválido o expirado."
-
-                if matched_step <= (last_otp_step or 0):
-                    return False, "Este código OTP ya fue utilizado. Espere 30 segundos para el siguiente código."
-
-                cur.execute(
-                    "UPDATE administradores SET ultimo_paso_otp = %s WHERE id = %s",
-                    (matched_step, admin_id),
-                )
-                conn.commit()
-                return True, "Identidad verificada para exportación descifrada."
-
-    except Exception:
-        logger.exception("Error interno en verify_admin_stepup_otp")
-        return False, "No fue posible verificar el código OTP."
 
 
 def export_users_to_csv(decrypt_sensitive: bool = False) -> tuple[bool, str, str | None]:
@@ -435,7 +313,9 @@ def export_users_to_csv(decrypt_sensitive: bool = False) -> tuple[bool, str, str
                     r[0], r[1], r[2],
                     decrypt_data(r[3]), decrypt_data(r[4]), decrypt_data(r[5]),
                     decrypt_data(r[6]), decrypt_data(r[7]),
-                    f"**** **** **** {r[8]}", r[9], r[10] or "Activo", r[11].isoformat()
+                    f"**** **** **** {r[8]}", r[9],
+                    r[10].isoformat() if r[10] else "Activo",
+                    r[11].isoformat() if r[11] else "",
                 ])
         else:
             writer.writerow([
@@ -448,7 +328,9 @@ def export_users_to_csv(decrypt_sensitive: bool = False) -> tuple[bool, str, str
                     r[0], r[1], r[2],
                     bytes(r[3]).hex()[:24] + "...", bytes(r[4]).hex()[:24] + "...", bytes(r[5]).hex()[:24] + "...",
                     bytes(r[6]).hex()[:24] + "...", bytes(r[7]).hex()[:24] + "...",
-                    f"**** {r[8]}", r[9], r[10] or "Activo", r[11].isoformat()
+                    f"**** {r[8]}", r[9],
+                    r[10].isoformat() if r[10] else "Activo",
+                    r[11].isoformat() if r[11] else "",
                 ])
 
         return True, "Reporte CSV generado correctamente.", output.getvalue()
@@ -457,3 +339,133 @@ def export_users_to_csv(decrypt_sensitive: bool = False) -> tuple[bool, str, str
         logger.exception("Error interno al exportar usuarios a CSV")
         return False, "No fue posible generar el archivo CSV en este momento.", None
 
+
+def authenticate_admin(identifier: str, password: str, otp_code: str) -> tuple[bool, str, str | None]:
+    """Autentica a un administrador contra la tabla aislada administradores con PyOTP atómico."""
+    clean_id = identifier.strip().lower()
+    clean_otp = otp_code.strip()
+
+    if not clean_id or not password or not clean_otp:
+        return False, "Todos los campos son obligatorios.", None
+
+    generic_error = "Credenciales administrativas o código OTP inválidos."
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, usuario, contrasena_hash, secreto_totp_cifrado,
+                           bloqueado_hasta, activo
+                    FROM administradores
+                    WHERE usuario = %s OR correo = %s
+                    """,
+                    (clean_id, clean_id),
+                )
+                row = cur.fetchone()
+
+                if not row:
+                    try:
+                        ph.verify(_DUMMY_HASH, password)
+                    except VerifyMismatchError:
+                        pass
+                    return False, generic_error, None
+
+                admin_id, username, password_hash, totp_secret_enc, locked_until, activo = row
+
+                now = datetime.now(timezone.utc)
+
+                if locked_until and locked_until > now:
+                    remaining = int((locked_until - now).total_seconds() // 60) + 1
+                    return False, f"Cuenta bloqueada por seguridad. Intente en {remaining} min.", None
+
+                try:
+                    ph.verify(password_hash, password)
+                except VerifyMismatchError:
+                    _register_failure(cur, conn, "administradores", admin_id, now)
+                    return False, generic_error, None
+
+                # Se revisa después de la contraseña para no revelar a un tercero
+                # qué cuentas administrativas existen.
+                if not activo:
+                    return False, "Cuenta administrativa deshabilitada.", None
+
+                if not re.fullmatch(r"\d{6}", clean_otp):
+                    _register_failure(cur, conn, "administradores", admin_id, now)
+                    return False, generic_error, None
+
+                matched_step = _verify_totp_step(totp_secret_enc, clean_otp)
+                if matched_step is None:
+                    _register_failure(cur, conn, "administradores", admin_id, now)
+                    return False, generic_error, None
+
+                cur.execute(
+                    """
+                    UPDATE administradores
+                    SET intentos_fallidos = 0, bloqueado_hasta = NULL, ultimo_paso_otp = %s
+                    WHERE id = %s AND (ultimo_paso_otp IS NULL OR ultimo_paso_otp < %s)
+                    """,
+                    (matched_step, admin_id, matched_step),
+                )
+                if cur.rowcount != 1:
+                    _register_failure(cur, conn, "administradores", admin_id, now)
+                    return False, "Este código OTP ya fue utilizado. Espere el siguiente código de 30 segundos.", None
+
+                conn.commit()
+                return True, "Acceso administrativo concedido.", username
+
+    except Exception:
+        logger.exception("Error interno en authenticate_admin")
+        return False, "Error de autenticación administrativa.", None
+
+
+def verify_admin_stepup_otp(admin_username: str, otp_code: str) -> tuple[bool, str]:
+    """Re-autenticación atómica con nuevo código OTP para exportar CSV descifrado."""
+    clean_otp = otp_code.strip()
+    if not admin_username or not re.fullmatch(r"\d{6}", clean_otp):
+        return False, "Ingrese un código OTP válido de 6 dígitos."
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, secreto_totp_cifrado, bloqueado_hasta
+                    FROM administradores
+                    WHERE usuario = %s AND activo = TRUE
+                    """,
+                    (admin_username,),
+                )
+                row = cur.fetchone()
+
+                if not row:
+                    return False, "Administrador no válido."
+
+                admin_id, totp_secret_enc, locked_until = row
+                now = datetime.now(timezone.utc)
+
+                if locked_until and locked_until > now:
+                    return False, "Cuenta bloqueada por seguridad. Intente más tarde."
+
+                matched_step = _verify_totp_step(totp_secret_enc, clean_otp)
+                if matched_step is None:
+                    _register_failure(cur, conn, "administradores", admin_id, now)
+                    return False, "Código OTP inválido o expirado."
+
+                cur.execute(
+                    """
+                    UPDATE administradores
+                    SET ultimo_paso_otp = %s
+                    WHERE id = %s AND (ultimo_paso_otp IS NULL OR ultimo_paso_otp < %s)
+                    """,
+                    (matched_step, admin_id, matched_step),
+                )
+                if cur.rowcount != 1:
+                    return False, "Este código OTP ya fue utilizado. Espere 30 segundos para el siguiente código."
+
+                conn.commit()
+                return True, "Identidad verificada para exportación descifrada."
+
+    except Exception:
+        logger.exception("Error interno en verify_admin_stepup_otp")
+        return False, "No fue posible verificar el código OTP."
