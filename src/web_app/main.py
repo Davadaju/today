@@ -6,6 +6,7 @@ all_pages = [
     st.Page("all_pages/3_A_page.py", title="Equipo A"),
     st.Page("all_pages/4_B_page.py", title="Equipo B"),
     st.Page("all_pages/5_C_page.py", title="Equipo Chat"),
+    st.Page("all_pages/6_admin_page.py", title="Administrador • Exportar datos"),
 ]
 
 def main() -> None:
