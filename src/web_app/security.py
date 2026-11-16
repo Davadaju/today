@@ -5,6 +5,9 @@ import time
 from datetime import datetime, timedelta, timezone
 import psycopg
 import pyotp
+import csv
+import io
+import hmac
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from cryptography.fernet import Fernet
@@ -249,4 +252,67 @@ def authenticate_user(identifier: str, password: str, otp_code: str) -> tuple[bo
     except Exception:
         logger.exception("Error interno durante la autenticación de usuario")
         return False, "Servicio de autenticación temporalmente no disponible. Intente más tarde.", None
+
+## Parte de admin, descarga de datos.
+
+def verify_admin_password(input_password: str) -> bool:
+    """Valida la contraseña del panel administrativo usando comparación segura contra timing attacks."""
+    admin_pass = os.getenv("ADMIN_PANEL_PASSWORD")
+    if not admin_pass or not input_password:
+        return False
+    return hmac.compare_digest(input_password, admin_pass)
+
+
+def export_users_to_csv(decrypt_sensitive: bool = False) -> tuple[bool, str, str | None]:
+    """Genera un string en formato CSV con los usuarios registrados en la base de datos."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, usuario, correo,
+                           nombre_completo_cifrado, documento_identidad_cifrado, telefono_cifrado,
+                           tipo_sangre_cifrado, condiciones_medicas_cifrado,
+                           ultimos_4_tarjeta, intentos_fallidos, bloqueado_hasta, fecha_creacion
+                    FROM usuarios
+                    ORDER BY id ASC
+                    """
+                )
+                rows = cur.fetchall()
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        if decrypt_sensitive:
+            writer.writerow([
+                "ID", "Usuario", "Correo", "Nombre Completo (PII)", "Documento (PII)",
+                "Teléfono (PII)", "Tipo Sangre (PHI)", "Condiciones Médicas (PHI)",
+                "Tarjeta Enmascarada (PCI)", "Intentos Fallidos", "Bloqueado Hasta", "Fecha Creación"
+            ])
+            for r in rows:
+                writer.writerow([
+                    r[0], r[1], r[2],
+                    decrypt_data(r[3]), decrypt_data(r[4]), decrypt_data(r[5]),
+                    decrypt_data(r[6]), decrypt_data(r[7]),
+                    f"**** **** **** {r[8]}", r[9], r[10] or "Activo", r[11].isoformat()
+                ])
+        else:
+            writer.writerow([
+                "ID", "Usuario", "Correo", "Nombre Completo (Cifrado)", "Documento (Cifrado)",
+                "Teléfono (Cifrado)", "Tipo Sangre (Cifrado)", "Condiciones Médicas (Cifrado)",
+                "Últimos 4 Tarjeta", "Intentos Fallidos", "Bloqueado Hasta", "Fecha Creación"
+            ])
+            for r in rows:
+                writer.writerow([
+                    r[0], r[1], r[2],
+                    bytes(r[3]).hex()[:24] + "...", bytes(r[4]).hex()[:24] + "...", bytes(r[5]).hex()[:24] + "...",
+                    bytes(r[6]).hex()[:24] + "...", bytes(r[7]).hex()[:24] + "...",
+                    f"**** {r[8]}", r[9], r[10] or "Activo", r[11].isoformat()
+                ])
+
+        return True, "Reporte CSV generado correctamente.", output.getvalue()
+
+    except Exception:
+        logger.exception("Error interno al exportar usuarios a CSV")
+        return False, "No fue posible generar el archivo CSV en este momento.", None
 
