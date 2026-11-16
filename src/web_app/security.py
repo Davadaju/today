@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import time
@@ -10,6 +11,8 @@ from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 ph = PasswordHasher()  # Usa Argon2id por defecto
 FERNET_KEY = os.getenv("FERNET_KEY")
@@ -24,11 +27,16 @@ TOTP_INTERVAL = 30
 
 
 def get_db_connection():
+    required_vars = ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+    missing = [var for var in required_vars if not os.getenv(var)]
+    if missing:
+        raise RuntimeError(f"Faltan variables de entorno de base de datos: {', '.join(missing)}")
+
     return psycopg.connect(
-        host=os.getenv("DB_HOST", "10.10.101.29"),
-        port=os.getenv("DB_PORT", "5432"),
-        dbname=os.getenv("DB_NAME", "ciber"),
-        user=os.getenv("DB_USER", "analyst"),
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT"),
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"),
     )
 
@@ -123,8 +131,9 @@ def register_user(
 
     except psycopg.errors.UniqueViolation:
         return False, "El usuario o correo ya se encuentra registrado.", None
-    except Exception as e:
-        return False, f"Error interno al registrar: {e}", None
+    except Exception:
+        logger.exception("Error interno durante el registro de usuario")
+        return False, "No fue posible procesar el registro en este momento. Intente más tarde.", None
 
 
 def authenticate_user(identifier: str, password: str, otp_code: str) -> tuple[bool, str, dict | None]:
@@ -237,5 +246,7 @@ def authenticate_user(identifier: str, password: str, otp_code: str) -> tuple[bo
                 }
                 return True, "Autenticación multifactor exitosa.", user_profile
 
-    except Exception as e:
-        return False, f"Error de conexión con el servidor de autenticación: {e}", None
+    except Exception:
+        logger.exception("Error interno durante la autenticación de usuario")
+        return False, "Servicio de autenticación temporalmente no disponible. Intente más tarde.", None
+
