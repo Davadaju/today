@@ -469,3 +469,124 @@ def verify_admin_stepup_otp(admin_username: str, otp_code: str) -> tuple[bool, s
     except Exception:
         logger.exception("Error interno en verify_admin_stepup_otp")
         return False, "No fue posible verificar el código OTP."
+
+def get_users_dashboard_stats() -> tuple[bool, str, dict | None]:
+    """
+    Métricas agregadas de la tabla usuarios para el dashboard administrativo.
+    No descifra ningún dato: solo usa conteos y columnas no sensibles
+    (usuario, fechas, intentos y bloqueos), así el panel no expone PII/PHI/PCI.
+    El último paso OTP equivale a la hora del último ingreso: paso × 30 s desde 1970.
+    """
+    tz = "America/Bogota"
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*),
+                        COUNT(*) FILTER (WHERE fecha_creacion >= NOW() - INTERVAL '7 days'),
+                        COUNT(*) FILTER (WHERE fecha_creacion >= NOW() - INTERVAL '24 hours'),
+                        COUNT(*) FILTER (WHERE bloqueado_hasta > NOW()),
+                        COUNT(*) FILTER (WHERE COALESCE(intentos_fallidos, 0) > 0),
+                        COUNT(*) FILTER (WHERE COALESCE(ultimo_paso_otp, 0) > 0),
+                        COUNT(*) FILTER (
+                            WHERE COALESCE(ultimo_paso_otp, 0) > 0
+                              AND to_timestamp(ultimo_paso_otp * %s) >= NOW() - INTERVAL '7 days'
+                        )
+                    FROM usuarios
+                    """,
+                    (TOTP_INTERVAL,),
+                )
+                total, nuevos_7d, nuevos_24h, bloqueados, con_fallos, con_ingreso, activos_7d = cur.fetchone()
+
+                cur.execute(
+                    """
+                    SELECT d::date AS dia, COUNT(u.id) AS registros
+                    FROM generate_series(
+                        (NOW() AT TIME ZONE %s)::date - 29,
+                        (NOW() AT TIME ZONE %s)::date,
+                        INTERVAL '1 day'
+                    ) AS d
+                    LEFT JOIN usuarios u
+                        ON (u.fecha_creacion AT TIME ZONE %s)::date = d::date
+                    GROUP BY d
+                    ORDER BY d
+                    """,
+                    (tz, tz, tz),
+                )
+                registros_por_dia = cur.fetchall()
+
+                cur.execute(
+                    """
+                    SELECT rango, COUNT(*) FROM (
+                        SELECT CASE
+                            WHEN COALESCE(intentos_fallidos, 0) = 0 THEN '0'
+                            WHEN intentos_fallidos <= 2 THEN '1-2'
+                            WHEN intentos_fallidos <= 4 THEN '3-4'
+                            ELSE '5 o más'
+                        END AS rango
+                        FROM usuarios
+                    ) t
+                    GROUP BY rango
+                    """
+                )
+                orden = ["0", "1-2", "3-4", "5 o más"]
+                conteos = dict(cur.fetchall())
+                intentos = [(r, conteos.get(r, 0)) for r in orden]
+
+                cur.execute(
+                    """
+                    SELECT split_part(correo, '@', 2) AS dominio, COUNT(*)
+                    FROM usuarios
+                    GROUP BY dominio
+                    ORDER BY COUNT(*) DESC, dominio
+                    LIMIT 8
+                    """
+                )
+                dominios = cur.fetchall()
+
+                cur.execute(
+                    """
+                    SELECT usuario, COALESCE(intentos_fallidos, 0), bloqueado_hasta
+                    FROM usuarios
+                    WHERE COALESCE(intentos_fallidos, 0) > 0 OR bloqueado_hasta > NOW()
+                    ORDER BY (bloqueado_hasta > NOW()) DESC NULLS LAST, intentos_fallidos DESC
+                    LIMIT 10
+                    """
+                )
+                en_riesgo = cur.fetchall()
+
+                cur.execute(
+                    """
+                    SELECT usuario,
+                           fecha_creacion,
+                           CASE WHEN COALESCE(ultimo_paso_otp, 0) > 0
+                                THEN to_timestamp(ultimo_paso_otp * %s) END
+                    FROM usuarios
+                    ORDER BY fecha_creacion DESC
+                    LIMIT 8
+                    """,
+                    (TOTP_INTERVAL,),
+                )
+                recientes = cur.fetchall()
+
+        stats = {
+            "total": total,
+            "nuevos_7d": nuevos_7d,
+            "nuevos_24h": nuevos_24h,
+            "bloqueados": bloqueados,
+            "con_fallos": con_fallos,
+            "con_ingreso": con_ingreso,
+            "activos_7d": activos_7d,
+            "registros_por_dia": registros_por_dia,
+            "intentos": intentos,
+            "dominios": dominios,
+            "en_riesgo": en_riesgo,
+            "recientes": recientes,
+        }
+        return True, "Métricas generadas correctamente.", stats
+
+    except Exception:
+        logger.exception("Error interno al generar métricas del dashboard")
+        return False, "No fue posible cargar el dashboard en este momento.", None
